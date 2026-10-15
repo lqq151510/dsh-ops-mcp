@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import stat
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -12,7 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from dsh_ops_mcp.batch import _normalize_steps, _op_rows, run_batch
-from dsh_ops_mcp.filesystem import roots
+from dsh_ops_mcp.filesystem import roots, walk
 from dsh_ops_mcp.results import ResultStore
 
 
@@ -143,6 +144,98 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(page["total"], 1)
         self.assertEqual(page["total_all"], 4)
         self.assertEqual(page["items"][0]["path"], f"{self.workspace.name}/src/alpha.txt")
+
+    def test_grep_many_results_can_be_filtered_by_query_and_indexed_path_prefix(self) -> None:
+        source_dir = self.workspace / "src"
+        source_dir.mkdir()
+        (source_dir / "alpha.py").write_text("needle alpha\nneedle beta\n", encoding="utf-8")
+        (source_dir / "beta.py").write_text("needle beta\n", encoding="utf-8")
+        result = run_batch(
+            [{"id": "search", "op": "grep_many", "patterns": ["alpha", "beta"], "glob": "**/*.py"}],
+            self.store,
+        )
+
+        page = self.store.page(
+            result["details_ref"], offset=0, limit=10, max_bytes=12_000,
+            queries=["beta"], path_prefix=f"{self.workspace.name}/src/",
+            fields=["query", "path", "line"],
+        )
+        self.assertEqual(page["total"], 2)
+        self.assertEqual(page["total_all"], 3)
+        self.assertTrue(all(item["query"] == "beta" for item in page["items"]))
+        self.assertEqual({item["path"] for item in page["items"]}, {
+            f"{self.workspace.name}/src/alpha.py", f"{self.workspace.name}/src/beta.py",
+        })
+
+    def test_path_prefix_filter_treats_percent_and_underscore_literally(self) -> None:
+        literal = self.workspace / "src%_literal"
+        wildcard_lookalike = self.workspace / "src1xliteral"
+        literal.mkdir()
+        wildcard_lookalike.mkdir()
+        (literal / "one.txt").write_text("needle\n", encoding="utf-8")
+        (wildcard_lookalike / "two.txt").write_text("needle\n", encoding="utf-8")
+        result = run_batch([{"op": "grep", "pattern": "needle"}], self.store)
+
+        page = self.store.page(
+            result["details_ref"], offset=0, limit=10, max_bytes=12_000,
+            path_prefix=f"{self.workspace.name}/src%_",
+        )
+        self.assertEqual(page["total"], 1)
+        self.assertTrue(page["items"][0]["path"].startswith(f"{self.workspace.name}/src%_"))
+
+    def test_grep_many_searches_all_queries_with_one_filesystem_walk(self) -> None:
+        (self.workspace / "a.txt").write_text("alpha\nbeta alpha\n", encoding="utf-8")
+        (self.workspace / "b.txt").write_text("beta\ngamma\n", encoding="utf-8")
+        with patch("dsh_ops_mcp.batch.walk", wraps=walk) as walk_mock:
+            result = run_batch(
+                [{"id": "search", "op": "grep_many", "patterns": ["alpha", "beta", "missing"], "limit": 2}],
+                self.store,
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(walk_mock.call_count, 1)
+        self.assertEqual(result["details_total"], 5)
+        self.assertEqual([row.get("query") for row in result["preview"]], ["alpha", "beta", "missing", "alpha", "beta"])
+        self.assertNotIn("operation", result["preview"][0])
+        self.assertNotIn("state", result["preview"][0])
+        beta = self.store.page(
+            result["details_ref"], offset=0, limit=10, max_bytes=12_000,
+            operations=["grep_many"], queries=["beta"], fields=["query", "path", "line", "value"],
+        )
+        self.assertEqual(beta["total"], 2)
+        self.assertTrue(all(row["query"] == "beta" for row in beta["items"]))
+
+    def test_legacy_result_rows_are_migrated_to_searchable_columns(self) -> None:
+        migration_state = self.base / "migration-state"
+        migration_state.mkdir()
+        db_path = migration_state / "results.sqlite3"
+        run_id = "a" * 32
+        with sqlite3.connect(db_path) as db:
+            db.execute(
+                "CREATE TABLE runs (id TEXT PRIMARY KEY, created REAL NOT NULL, state TEXT NOT NULL, "
+                "steps_total INTEGER NOT NULL, elapsed_ms INTEGER NOT NULL DEFAULT 0, owner_pid INTEGER NOT NULL DEFAULT 0)"
+            )
+            db.execute(
+                "CREATE TABLE result_rows (run_id TEXT NOT NULL, seq INTEGER NOT NULL, step_id TEXT NOT NULL, "
+                "operation TEXT NOT NULL, state TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (run_id, seq))"
+            )
+            db.execute(
+                "INSERT INTO runs(id, created, state, steps_total) VALUES (?, strftime('%s','now'), 'completed', 1)",
+                (run_id,),
+            )
+            db.execute(
+                "INSERT INTO result_rows VALUES (?, 0, 'search', 'grep', 'completed', ?)",
+                (run_id, json.dumps({"step_id": "search", "operation": "grep", "state": "completed", "path": "src/a.py", "query": "needle"})),
+            )
+        with patch.dict(os.environ, {"DSH_OPS_STATE_DIR": str(migration_state)}):
+            migrated = ResultStore()
+            page = migrated.page(
+                run_id, offset=0, limit=10, max_bytes=12_000,
+                path_prefix="src/", queries=["needle"], fields=["path", "query"],
+            )
+
+        self.assertEqual(page["total"], 1)
+        self.assertEqual(page["items"], [{"path": "src/a.py", "query": "needle"}])
 
     def test_expected_hash_preserves_existing_file_mode(self) -> None:
         path = self.workspace / "script.py"

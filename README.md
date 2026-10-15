@@ -26,10 +26,10 @@ uv run dsh-ops-mcp
 - `ops_inspect_local_file(path, start_line?, max_chars?)`
 - `ops_glob(pattern?, limit?)`
 - `ops_grep(pattern, glob?, limit?, case_sensitive?)`（字面字符串，不执行正则表达式）
-- `ops_batch(steps, idempotency_key?)`：单次调用串行预检并执行多项允许的文件操作。有写入、复制、目录创建等副作用的批次必须传幂等键；同一键配合同一批步骤重复提交时不重复执行。回执附带最多 5 条、约 3 KB 的安全预览；较长的 `path`、`other`、`value` 和 `error` 会截短并在该行标记 `truncated_fields`。
-- `ops_result(details_ref, action?, offset?, limit?, max_bytes?, fields?, step_ids?, operations?, states?, path_prefix?)`：按页查看完整结果，可先按步骤、操作类型、状态或路径前缀过滤，也可以释放本地结果。
+- `ops_batch(steps, idempotency_key?)`：单次调用串行预检并执行多项允许的文件操作。要搜多个字面词时，用一个 `grep_many` 步骤（2–20 个词）一次遍历目录，默认每词最多返回 5 条；结果交错排列，避免高频词占满预览。有副作用的批次必须传幂等键；回执附带最多 5 条、约 3 KB 的安全预览，并省略已能从请求推知的重复字段。
+- `ops_result(details_ref, action?, offset?, limit?, max_bytes?, fields?, step_ids?, operations?, states?, path_prefix?, queries?)`：按页查看完整结果，可按步骤、操作类型、状态、路径前缀或 `grep_many` 搜索词过滤。路径和查询词从 SQLite 索引列筛选，不必先把整批 JSON 明细加载到内存；也可以释放本地结果。
 
-批次操作类型：`mkdir`、`write_text`、`replace_text`、`copy`、`read_text`、`glob`、`grep`、`count_lines`、`sha256`、`assert_contains`、`assert_equal`、`exists`。每步可以指定 `id`，后续写入可用 `$step_id.sha256` 引用之前读取或计算出的哈希。`count_lines` 与 `wc -l` 一致，统计换行符数量。
+批次操作类型：`mkdir`、`write_text`、`replace_text`、`copy`、`read_text`、`glob`、`grep`、`grep_many`、`count_lines`、`sha256`、`assert_contains`、`assert_equal`、`exists`。`grep_many` 的每条结果带 `query`，后续可以用 `ops_result(queries=[...])` 只取指定词的命中。每步可以指定 `id`，后续写入可用 `$step_id.sha256` 引用之前读取或计算出的哈希。`count_lines` 与 `wc -l` 一致，统计换行符数量。
 
 示例：
 
@@ -54,14 +54,15 @@ uv run dsh-ops-mcp
   "details_ref": "<batch reference>",
   "offset": 0,
   "step_ids": ["matches"],
-  "operations": ["grep"],
+  "operations": ["grep_many"],
   "path_prefix": "src/",
+  "queries": ["TODO"],
   "limit": 20
 }
 ```
 
-过滤后的 `total` 表示匹配数，`total_all` 表示批次全部结果数。运行测试、任意 shell 命令和动态执行模型生成的代码仍由客户端宿主处理，当前 MCP 不会代替它们。已有五次真实模型读取对照，以及一次真实模型生成参数并经 stdio MCP 验证写入重试去重；适用边界见下方基准记录。读取对照只代表该小型任务，不是一般任务的固定节省比例。
+过滤后的 `total` 表示匹配数，`total_all` 表示批次全部结果数。运行测试、任意 shell 命令和动态执行模型生成的代码仍由客户端宿主处理，当前 MCP 不会代替它们。是否减少模型 token 取决于返回内容和客户端上下文；不能仅凭 MCP 调用减少推断 token 一定下降。基准文档记录历史读取对照和多词检索对照，并区分工具调用、响应体大小、模型轮次及模型 token。
 
-基准文档 [`docs/call-reduction-benchmark.md`](docs/call-reduction-benchmark.md) 记录了对照方法、重试安全验收和指标口径；单一任务不能外推为通用收益。
+基准文档 [`docs/call-reduction-benchmark.md`](docs/call-reduction-benchmark.md) 记录了对照方法、实测结果和指标口径；单一任务不能外推为通用收益。
 
 将服务配置到 MCP 客户端时，把命令指向本地安装环境中的 `dsh-ops-mcp` 可执行文件，并通过 `DSH_OPS_ROOTS` 设置该客户端允许访问的项目目录。客户端的配置格式可能不同，请按对应客户端的 MCP 文档填写。

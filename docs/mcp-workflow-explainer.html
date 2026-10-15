@@ -32,7 +32,7 @@
   </section>
   <section class="below">
     <article class="panel"><h2>一个生活里的比喻</h2><div class="analogy"><div class="big">🧑🏻‍🔬</div><p><strong>模型像研究员。</strong>它会分析问题，但它看不到你的硬盘，也不能凭空操作文件。<br><strong>MCP 像统一的服务窗口。</strong>模型按约定递交请求，文件工具去查，再把结果送回来。</p></div><div class="chips"><span class="chip">模型：决定下一步</span><span class="chip">MCP：约定怎么请求</span><span class="chip">工具：真正执行读取</span></div></article>
-    <article class="panel truth"><h2>对当前这个项目，实际到哪了？</h2><p><code>ops_batch</code> 能在一次 MCP 调用中预检并执行最多 512 个允许的文件步骤；完整明细保存在本机，回执附最多 5 条、约 3 KB 的预览以及 <code>details_ref</code>。较长结果再由 <code>ops_result</code> 按页、按条件取回。小结果有机会省掉一次结果查询。写入类批次要求幂等键；客户端重试同一请求时会复用原结果，避免重复写文件。它不等于任意代码执行 PTC，也不保证达到视频展示的 27.7 倍。</p><span class="now">当前：批量文件操作 + 有界预览 + 本地结果分页 + 写入重试去重</span></article>
+    <article class="panel truth"><h2>对当前这个项目，实际到哪了？</h2><p><code>ops_batch</code> 能在一次 MCP 调用中预检并执行最多 512 个允许的文件步骤；<code>grep_many</code> 可在一次目录遍历中搜多个字面词。完整明细保存在本机，回执省略已知重复字段并附最多 5 条预览；<code>ops_result</code> 再按查询词、路径前缀或其他条件分页。SQLite 索引让过滤只读取相关结果。这样可减少重复扫描、工具往返和无关回传；模型 token 是否下降仍要用同一模型和任务实测。它不等于任意代码执行 PTC，也不保证达到视频展示的 27.7 倍。</p><span class="now">当前：单次多词检索 + 索引过滤 + 紧凑预览 + 本地分页</span></article>
   </section>
   <section class="timeline"><h2>什么时候会有帮助？</h2><div class="steps"><article class="step"><span class="n">01</span><b>文件少、任务简单</b><p>直接读取就够了，MCP 可能没有额外收益。</p></article><article class="step"><span class="n">02</span><b>文件多、结果很长</b><p>先返回有限摘要，再查看相关片段，能减少无关内容。</p></article><article class="step"><span class="n">03</span><b>同类任务反复做</b><p>一致的工具契约可复用在多个支持 MCP 的客户端中。</p></article><article class="step"><span class="n">04</span><b>要批量修改文件</b><p>写入批次附上幂等键；网络重试复用同一键，服务不会重复执行。</p></article></div></section>
   <footer class="footer"><span>DESIGN PRINCIPLE / 工具提升工作流，不提升模型本体</span><span>适用范围：本地代码与文件类任务</span></footer>
@@ -51,8 +51,8 @@ const states={
  mcp:[
   ['模型提出标准化工具请求。','例如请求“搜索配置项”，并附上目录范围和查询词。'],
   ['MCP 把约定的请求交给服务端工具。','MCP 负责工具发现、参数和调用格式；它本身不搜索文件。'],
-  ['服务端在允许范围内执行并返回结果。','结果可以做数量和长度限制；若实现了分页句柄，再按需取下一页。'],
-  ['模型根据结果继续判断或回答。','遇到证据不足可继续请求。MCP 不保证更准，只提供可复用的工具路径。']
+  ['服务端在允许范围内执行并返回结果。','grep_many 可让多个词共用一次目录遍历；路径前缀和查询词通过 SQLite 索引过滤。'],
+  ['模型根据结果继续判断或回答。','先收紧预览与过滤条件，需要更多证据时再分页；减少回传有助于节省上下文 token。']
  ]
 };
 function setMode(next){mode=next;direct.setAttribute('aria-pressed',String(next==='direct'));mcp.setAttribute('aria-pressed',String(next==='mcp'));step=0;stop();update(0)}

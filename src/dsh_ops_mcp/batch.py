@@ -88,6 +88,16 @@ def _read(path: Path) -> str:
         raise ValueError("file is not valid UTF-8 text") from exc
 
 
+def _matches_glob(path: str, pattern: str) -> bool:
+    # In common glob syntax, **/ also matches zero directories. fnmatch does
+    # not provide that behavior, so try the pattern without its recursive prefix.
+    return (
+        fnmatch.fnmatchcase(path, pattern)
+        or (pattern.startswith("**/") and fnmatch.fnmatchcase(path, pattern[3:]))
+        or Path(path).match(pattern)
+    )
+
+
 def _digest_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -474,7 +484,7 @@ def _op_rows(step: dict[str, Any]) -> list[dict[str, Any]]:
         for root in roots():
             for file in walk(root, skip_common=True):
                 rel = file.relative_to(root).as_posix()
-                if fnmatch.fnmatchcase(rel, pattern) or Path(rel).match(pattern):
+                if _matches_glob(rel, pattern):
                     found.append(f"{root.name}/{rel}")
                     if len(found) >= limit:
                         break
@@ -491,7 +501,7 @@ def _op_rows(step: dict[str, Any]) -> list[dict[str, Any]]:
         for root in roots():
             for file in walk(root, skip_common=True):
                 rel = file.relative_to(root).as_posix()
-                if not (fnmatch.fnmatchcase(rel, glob) or Path(rel).match(glob)) or file.stat().st_size > MAX_FILE_BYTES:
+                if not _matches_glob(rel, glob) or file.stat().st_size > MAX_FILE_BYTES:
                     continue
                 try:
                     lines = file.read_text(encoding="utf-8").splitlines()
@@ -513,7 +523,7 @@ def _op_rows(step: dict[str, Any]) -> list[dict[str, Any]]:
         for root in roots():
             for file in walk(root, skip_common=True):
                 rel = file.relative_to(root).as_posix()
-                if not (fnmatch.fnmatchcase(rel, glob) or Path(rel).match(glob)):
+                if not _matches_glob(rel, glob):
                     continue
                 try:
                     if file.stat().st_size > MAX_FILE_BYTES:

@@ -16,6 +16,16 @@ MAX_STORE_BYTES = 64 * 1024 * 1024
 MAX_PAGE_BYTES = 64 * 1024
 
 
+def _prefix_upper_bound(prefix: str) -> str | None:
+    """Return the exclusive BINARY-collation bound for all strings starting with prefix."""
+    codepoints = list(prefix)
+    for index in range(len(codepoints) - 1, -1, -1):
+        value = ord(codepoints[index])
+        if value < 0x10FFFF:
+            return "".join(codepoints[:index]) + chr(value + 1)
+    return None
+
+
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -75,7 +85,27 @@ class ResultStore:
                 "operation TEXT NOT NULL, state TEXT NOT NULL, payload TEXT NOT NULL, "
                 "PRIMARY KEY (run_id, seq), FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE)"
             )
+            result_columns = {row["name"] for row in db.execute("PRAGMA table_info(result_rows)")}
+            added_columns: set[str] = set()
+            for column in ("path", "query"):
+                if column not in result_columns:
+                    db.execute(f"ALTER TABLE result_rows ADD COLUMN {column} TEXT")
+                    added_columns.add(column)
+            if added_columns:
+                # Preserve rows written by earlier versions while making common filters indexable.
+                for row in db.execute("SELECT run_id, seq, payload FROM result_rows").fetchall():
+                    payload = json.loads(row["payload"])
+                    values = {column: payload.get(column) for column in added_columns}
+                    values = {column: value for column, value in values.items() if isinstance(value, str)}
+                    if values:
+                        assignments = ", ".join(f"{column}=?" for column in values)
+                        db.execute(
+                            f"UPDATE result_rows SET {assignments} WHERE run_id=? AND seq=?",
+                            [*values.values(), row["run_id"], row["seq"]],
+                        )
             db.execute("CREATE INDEX IF NOT EXISTS result_rows_run ON result_rows(run_id, seq)")
+            db.execute("CREATE INDEX IF NOT EXISTS result_rows_run_path_seq ON result_rows(run_id, path, seq)")
+            db.execute("CREATE INDEX IF NOT EXISTS result_rows_run_query_seq ON result_rows(run_id, query, seq)")
             db.execute(
                 "CREATE TABLE IF NOT EXISTS idempotency_keys ("
                 "key TEXT PRIMARY KEY, request_hash TEXT NOT NULL, run_id TEXT NOT NULL, "
@@ -140,7 +170,8 @@ class ResultStore:
         with self._connect() as db:
             last = db.execute("SELECT COALESCE(MAX(seq), -1) FROM result_rows WHERE run_id=?", (run_id,)).fetchone()[0]
             db.executemany(
-                "INSERT INTO result_rows(run_id, seq, step_id, operation, state, payload) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO result_rows(run_id, seq, step_id, operation, state, payload, path, query) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (
                         run_id,
@@ -149,6 +180,8 @@ class ResultStore:
                         str(row.get("operation", "")),
                         str(row.get("state", "completed")),
                         json.dumps(row, ensure_ascii=False, separators=(",", ":")),
+                        row.get("path") if isinstance(row.get("path"), str) else None,
+                        row.get("query") if isinstance(row.get("query"), str) else None,
                     )
                     for index, row in enumerate(rows)
                 ],
@@ -167,7 +200,8 @@ class ResultStore:
             db.execute("UPDATE result_rows SET seq=seq+1000000 WHERE run_id=? AND seq>=?", (run_id, first_seq))
             db.execute("DELETE FROM result_rows WHERE run_id=? AND step_id=?", (run_id, step_id))
             db.executemany(
-                "INSERT INTO result_rows(run_id, seq, step_id, operation, state, payload) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO result_rows(run_id, seq, step_id, operation, state, payload, path, query) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (
                         run_id,
@@ -176,6 +210,8 @@ class ResultStore:
                         str(row.get("operation", "")),
                         str(row.get("state", "completed")),
                         json.dumps(row, ensure_ascii=False, separators=(",", ":")),
+                        row.get("path") if isinstance(row.get("path"), str) else None,
+                        row.get("query") if isinstance(row.get("query"), str) else None,
                     )
                     for index, row in enumerate(rows)
                 ],
@@ -248,6 +284,7 @@ class ResultStore:
         operations: list[str] | None = None,
         states: list[str] | None = None,
         path_prefix: str | None = None,
+        queries: list[str] | None = None,
     ) -> dict[str, Any]:
         if not run_id or len(run_id) != 32 or any(ch not in "0123456789abcdef" for ch in run_id):
             raise ValueError("invalid result reference")
@@ -255,7 +292,7 @@ class ResultStore:
             raise ValueError("offset must be non-negative and limit must be between 1 and 200")
         if not 1024 <= max_bytes <= MAX_PAGE_BYTES:
             raise ValueError(f"max_bytes must be between 1024 and {MAX_PAGE_BYTES}")
-        allowed = {"step_id", "operation", "state", "path", "other", "line", "value", "error", "count", "sha256", "bytes", "lines"}
+        allowed = {"step_id", "operation", "state", "path", "query", "other", "line", "value", "error", "count", "sha256", "bytes", "lines"}
         selected = fields or sorted(allowed)
         if not selected or set(selected) - allowed:
             raise ValueError(f"fields may only contain: {', '.join(sorted(allowed))}")
@@ -263,15 +300,17 @@ class ResultStore:
         filters: list[tuple[str, list[str]]] = []
         for label, values, permitted in (
             ("step_ids", step_ids, None),
-            ("operations", operations, {"mkdir", "write_text", "replace_text", "copy", "read_text", "glob", "grep", "count_lines", "sha256", "assert_contains", "assert_equal", "exists"}),
+            ("operations", operations, {"mkdir", "write_text", "replace_text", "copy", "read_text", "glob", "grep", "grep_many", "count_lines", "sha256", "assert_contains", "assert_equal", "exists"}),
             ("states", states, {"completed", "failed", "unknown", "pending", "preflight_ok", "running"}),
+            ("queries", queries, None),
         ):
             if values is None:
                 continue
             if not isinstance(values, list) or not 1 <= len(values) <= 100:
                 raise ValueError(f"{label} must contain between 1 and 100 values")
-            if any(not isinstance(value, str) or not value or len(value) > 128 for value in values):
-                raise ValueError(f"{label} values must be non-empty strings no longer than 128 characters")
+            max_length = 128
+            if any(not isinstance(value, str) or not value or len(value) > max_length for value in values):
+                raise ValueError(f"{label} values must be non-empty strings no longer than {max_length} characters")
             if permitted is not None and set(values) - permitted:
                 raise ValueError(f"{label} contains an unsupported value")
             filters.append((label, list(dict.fromkeys(values))))
@@ -288,23 +327,22 @@ class ResultStore:
             where = ["run_id=?"]
             parameters: list[Any] = [run_id]
             for label, values in filters:
-                column = {"step_ids": "step_id", "operations": "operation", "states": "state"}[label]
+                column = {"step_ids": "step_id", "operations": "operation", "states": "state", "queries": "query"}[label]
                 where.append(f"{column} IN ({','.join('?' for _ in values)})")
                 parameters.extend(values)
+            if path_prefix is not None:
+                upper = _prefix_upper_bound(path_prefix)
+                where.append("path >= ?")
+                parameters.append(path_prefix)
+                if upper is not None:
+                    where.append("path < ?")
+                    parameters.append(upper)
             where_sql = " AND ".join(where)
-            if path_prefix is None:
-                total = db.execute(f"SELECT COUNT(*) FROM result_rows WHERE {where_sql}", parameters).fetchone()[0]
-                rows = db.execute(
-                    f"SELECT payload FROM result_rows WHERE {where_sql} ORDER BY seq LIMIT ? OFFSET ?",
-                    [*parameters, limit, offset],
-                ).fetchall()
-            else:
-                candidates = db.execute(
-                    f"SELECT payload FROM result_rows WHERE {where_sql} ORDER BY seq", parameters
-                ).fetchall()
-                matching = [row for row in candidates if str(json.loads(row["payload"]).get("path", "")).startswith(path_prefix)]
-                total = len(matching)
-                rows = matching[offset : offset + limit]
+            total = db.execute(f"SELECT COUNT(*) FROM result_rows WHERE {where_sql}", parameters).fetchone()[0]
+            rows = db.execute(
+                f"SELECT payload FROM result_rows WHERE {where_sql} ORDER BY seq LIMIT ? OFFSET ?",
+                [*parameters, limit, offset],
+            ).fetchall()
 
         items: list[dict[str, Any]] = []
         used = len('{"id":"","offset":0,"total":0,"items":[],"next_offset":null,"complete":true}')

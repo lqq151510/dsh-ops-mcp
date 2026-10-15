@@ -90,7 +90,7 @@ def ops_grep(pattern: str, glob: str = "**/*", limit: int = 50, case_sensitive: 
 
 @mcp.tool()
 def ops_batch(steps: list[dict[str, Any]], idempotency_key: str | None = None) -> dict[str, Any]:
-    """Execute 1-512 related, allowlisted file operations in one call. Mutating batches require an idempotency_key that callers reuse unchanged when retrying; identical retries return the original outcome and conflicting reuse is rejected. Results are retained locally with a bounded preview and details_ref. No arbitrary shell or code execution is available."""
+    """Execute 1-512 related, allowlisted file operations in one call. Use grep_many to search 2-20 literal terms in one filesystem pass. Mutating batches require an idempotency_key reused unchanged when retrying. Results stay local with a bounded preview and details_ref."""
     return run_batch(steps, _result_store(), idempotency_key)
 
 
@@ -106,8 +106,9 @@ def ops_result(
     operations: list[str] | None = None,
     states: list[str] | None = None,
     path_prefix: str | None = None,
+    queries: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Retrieve locally stored batch results by page, fields, step_ids, operations, states, or path_prefix; or release the reference."""
+    """Retrieve batch results by page, fields, step_ids, operations, states, literal path_prefix, or grep_many queries; or release the reference."""
     store = _result_store()
     if action == "release":
         return {"released": store.release(details_ref)}
@@ -121,6 +122,7 @@ def ops_result(
         operations=operations,
         states=states,
         path_prefix=path_prefix,
+        queries=queries,
     )
 
 
