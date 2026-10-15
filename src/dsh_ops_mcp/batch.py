@@ -699,6 +699,61 @@ def _summary(
         "completed" if not failed_steps and not pending_steps and not unknown_steps
         else ("preflight_failed" if failed_steps and not completed_steps else "partial_failure")
     )
+
+    compact_search = (
+        status == "completed"
+        and steps_total == 1
+        and bool(rows)
+        and all(row.get("operation") == "grep_many" and row.get("state") == "completed" for row in rows)
+    )
+    if compact_search:
+        compact_preview: dict[str, list[list[Any]]] = {}
+        preview_rows = 0
+        preview_next_offset: int | None = None
+        for index, row in enumerate(rows):
+            if preview_rows >= MAX_PREVIEW_ROWS:
+                preview_next_offset = index
+                break
+            path = row.get("path")
+            truncated = False
+            if isinstance(path, str) and len(path) > MAX_PREVIEW_TEXT_CHARS:
+                path = path[:MAX_PREVIEW_TEXT_CHARS]
+                truncated = True
+            query = str(row.get("query", ""))
+            is_no_match = path is None
+            previous = compact_preview.get(query)
+            if previous is None:
+                compact_preview[query] = []
+            if not is_no_match:
+                compact_preview[query].append([path, row.get("line")])
+            current_bytes = _json_bytes(compact_preview)
+            if current_bytes > MAX_PREVIEW_BYTES:
+                if not is_no_match:
+                    compact_preview[query].pop()
+                if previous is None:
+                    compact_preview.pop(query)
+                preview_next_offset = index
+                break
+            preview_rows += 1
+            if truncated:
+                preview_next_offset = index
+                break
+        else:
+            if preview_rows < len(rows):
+                preview_next_offset = preview_rows
+
+        compact_result: dict[str, Any] = {
+            "status": status,
+            "details_ref": run_id,
+            "details_total": len(rows),
+            "preview": compact_preview,
+        }
+        if preview_next_offset is not None:
+            compact_result["preview_next_offset"] = preview_next_offset
+        if deduplicated:
+            compact_result["deduplicated"] = True
+        return compact_result
+
     preview: list[dict[str, Any]] = []
     preview_bytes = 0
     for row in rows[:MAX_PREVIEW_ROWS]:

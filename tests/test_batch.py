@@ -195,15 +195,39 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(walk_mock.call_count, 1)
         self.assertEqual(result["details_total"], 5)
-        self.assertEqual([row.get("query") for row in result["preview"]], ["alpha", "beta", "missing", "alpha", "beta"])
-        self.assertNotIn("operation", result["preview"][0])
-        self.assertNotIn("state", result["preview"][0])
+        self.assertEqual(list(result["preview"]), ["alpha", "beta", "missing"])
+        self.assertEqual(result["preview"]["alpha"], [[f"{self.workspace.name}/a.txt", 1], [f"{self.workspace.name}/a.txt", 2]])
+        self.assertEqual(result["preview"]["beta"], [[f"{self.workspace.name}/a.txt", 2], [f"{self.workspace.name}/b.txt", 1]])
+        self.assertEqual(result["preview"]["missing"], [])
+        self.assertNotIn("preview_next_offset", result)
         beta = self.store.page(
             result["details_ref"], offset=0, limit=10, max_bytes=12_000,
             operations=["grep_many"], queries=["beta"], fields=["query", "path", "line", "value"],
         )
         self.assertEqual(beta["total"], 2)
         self.assertTrue(all(row["query"] == "beta" for row in beta["items"]))
+
+    def test_compact_grep_preview_cursor_retrieves_full_text_from_local_store(self) -> None:
+        for index, text in enumerate(("alpha", "beta", "gamma")):
+            (self.workspace / f"{index}-one.txt").write_text(f"{text} first\n", encoding="utf-8")
+            (self.workspace / f"{index}-two.txt").write_text(f"{text} second\n", encoding="utf-8")
+        result = run_batch(
+            [{"op": "grep_many", "patterns": ["alpha", "beta", "gamma"], "limit": 2}],
+            self.store,
+        )
+
+        self.assertEqual(result["details_total"], 6)
+        self.assertEqual(result["preview_next_offset"], 5)
+        last = self.store.page(
+            result["details_ref"], offset=result["preview_next_offset"], limit=1,
+            max_bytes=12_000, fields=["query", "path", "line", "value"],
+        )
+        self.assertEqual(last["items"], [{
+            "query": "gamma",
+            "path": f"{self.workspace.name}/2-two.txt",
+            "line": 1,
+            "value": "gamma second",
+        }])
 
     def test_legacy_result_rows_are_migrated_to_searchable_columns(self) -> None:
         migration_state = self.base / "migration-state"
@@ -236,6 +260,22 @@ class BatchTests(unittest.TestCase):
 
         self.assertEqual(page["total"], 1)
         self.assertEqual(page["items"], [{"path": "src/a.py", "query": "needle"}])
+
+    def test_path_and_query_filters_use_sqlite_indexes(self) -> None:
+        with self.store._connect() as db:
+            path_plan = db.execute(
+                "EXPLAIN QUERY PLAN SELECT seq FROM result_rows "
+                "WHERE run_id=? AND path>=? AND path<? ORDER BY seq LIMIT 20",
+                ("a" * 32, "src/", "src0"),
+            ).fetchall()
+            query_plan = db.execute(
+                "EXPLAIN QUERY PLAN SELECT seq FROM result_rows "
+                "WHERE run_id=? AND query=? ORDER BY seq LIMIT 20",
+                ("a" * 32, "needle"),
+            ).fetchall()
+
+        self.assertTrue(any("result_rows_run_path_seq" in row["detail"] for row in path_plan))
+        self.assertTrue(any("result_rows_run_query_seq" in row["detail"] for row in query_plan))
 
     def test_expected_hash_preserves_existing_file_mode(self) -> None:
         path = self.workspace / "script.py"

@@ -332,9 +332,12 @@ class ResultStore:
                 parameters.extend(values)
             if path_prefix is not None:
                 upper = _prefix_upper_bound(path_prefix)
-                where.append("path >= ?")
-                parameters.append(path_prefix)
-                if upper is not None:
+                if upper is None:
+                    where.append("substr(path, 1, ?) = ?")
+                    parameters.extend((len(path_prefix), path_prefix))
+                else:
+                    where.append("path >= ?")
+                    parameters.append(path_prefix)
                     where.append("path < ?")
                     parameters.append(upper)
             where_sql = " AND ".join(where)

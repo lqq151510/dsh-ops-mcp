@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import os
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
@@ -21,7 +22,6 @@ def _result_store() -> ResultStore:
     return ResultStore()
 
 
-@mcp.tool()
 def ops_inspect_local_file(path: str, start_line: int = 1, max_chars: int = 12000) -> str:
     """Read one bounded UTF-8 file. For several related reads/searches, prefer ops_batch and fetch details with ops_result."""
     if start_line < 1:
@@ -39,7 +39,6 @@ def ops_inspect_local_file(path: str, start_line: int = 1, max_chars: int = 1200
     return f"# {target.relative_to(root)} (lines {start_line}-{min(len(lines), start_line + excerpt.count(chr(10)))} of {len(lines)})\n{excerpt}"
 
 
-@mcp.tool()
 def ops_glob(pattern: str = "**/*", limit: int = 100) -> str:
     """List matching relative file paths. For multi-step or large-result work, prefer ops_batch and fetch details with ops_result."""
     if not 1 <= limit <= MAX_MATCHES:
@@ -58,7 +57,6 @@ def ops_glob(pattern: str = "**/*", limit: int = 100) -> str:
     return "\n".join(matches) if matches else "No matching files found."
 
 
-@mcp.tool()
 def ops_grep(pattern: str, glob: str = "**/*", limit: int = 50, case_sensitive: bool = False) -> str:
     """Search for a literal string. For batched searches or large results, prefer ops_batch and fetch details with ops_result."""
     if not pattern:
@@ -90,7 +88,7 @@ def ops_grep(pattern: str, glob: str = "**/*", limit: int = 50, case_sensitive: 
 
 @mcp.tool()
 def ops_batch(steps: list[dict[str, Any]], idempotency_key: str | None = None) -> dict[str, Any]:
-    """Execute 1-512 related, allowlisted file operations in one call. Use grep_many to search 2-20 literal terms in one filesystem pass. Mutating batches require an idempotency_key reused unchanged when retrying. Results stay local with a bounded preview and details_ref."""
+    """Execute 1-512 related allowlisted file operations in one call. grep_many searches 2-20 literal terms in one filesystem pass; a single-step search preview maps each query to [path, line] pairs, with snippets available through ops_result. Mutating batches require a stable idempotency_key on retries."""
     return run_batch(steps, _result_store(), idempotency_key)
 
 
@@ -124,6 +122,14 @@ def ops_result(
         path_prefix=path_prefix,
         queries=queries,
     )
+
+
+if os.environ.get("DSH_OPS_ENABLE_LEGACY_TOOLS", "").strip().lower() in {"1", "true", "yes"}:
+    # Keep old entry points available for clients that need a transition period.
+    # The default surface exposes only the batched workflow to reduce tool schemas.
+    mcp.tool()(ops_inspect_local_file)
+    mcp.tool()(ops_glob)
+    mcp.tool()(ops_grep)
 
 
 def main() -> None:
