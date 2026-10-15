@@ -1,0 +1,13 @@
+[project]
+name = "dsh-ops-mcp"
+version = "0.1.0"
+description = "Cross-platform MCP server for batched, bounded project file operations"
+requires-python = ">=3.11"
+dependencies = ["mcp>=1.12,<2"]
+
+[project.scripts]
+dsh-ops-mcp = "dsh_ops_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
